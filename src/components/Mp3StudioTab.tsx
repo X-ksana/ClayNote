@@ -3,10 +3,13 @@ import {
   AudioLines,
   CheckCircle2,
   FileAudio,
+  Mic2,
+  Music,
   Play,
   SlidersHorizontal,
   Sparkles,
   Square,
+  Trash2,
   Upload,
   Wand2,
 } from 'lucide-react';
@@ -24,7 +27,9 @@ import {
   analyzeAudioBufferToMelody,
   convertRawNotesToSong,
   createSampleMelodyAudioBlob,
+  ExtractionMode,
   findBestTransposition,
+  RawExtractedNote,
 } from '../utils/mp3Analyzer';
 import { OcarinaDiagram } from './OcarinaDiagram';
 
@@ -32,6 +37,31 @@ interface Mp3StudioTabProps {
   ocarinaType: OcarinaType;
   ocarinaKey: OcarinaKey;
   onSaveAndOpenSong: (song: Song) => void;
+}
+
+function formatTime(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}:${rem.toString().padStart(2, '0')}`;
+}
+
+async function decodeAudioSafely(arrayBuffer: ArrayBuffer): Promise<AudioBuffer> {
+  const copy = arrayBuffer.slice(0);
+  try {
+    const ctx = getAudioContext();
+    return await ctx.decodeAudioData(copy);
+  } catch {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const tempCtx = new AudioCtx();
+    try {
+      return await tempCtx.decodeAudioData(arrayBuffer.slice(0));
+    } finally {
+      tempCtx.close().catch(() => {});
+    }
+  }
 }
 
 export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
@@ -49,9 +79,14 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
   });
   const [error, setError] = useState<string | null>(null);
 
-  const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
-  const [minNoteSec, setMinNoteSec] = useState<number>(0.14);
+  const [extractionMode, setExtractionMode] = useState<ExtractionMode>('vocal');
+  const [startSec, setStartSec] = useState<number>(0);
+  const [windowSec, setWindowSec] = useState<number>(60);
+  const [minNoteSec, setMinNoteSec] = useState<number>(0.13);
   const [sensitivity, setSensitivity] = useState<number>(0.08);
+
+  const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const [editableRawNotes, setEditableRawNotes] = useState<RawExtractedNote[]>([]);
   const [transpose, setTranspose] = useState<number>(0);
   const [foldOutOfRange, setFoldOutOfRange] = useState<boolean>(true);
   const [bpm, setBpm] = useState<number>(100);
@@ -79,17 +114,35 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     return () => stopPlayback();
   }, []);
 
-  const runAnalysis = async (buf: AudioBuffer, minSec: number, sens: number) => {
+  const runAnalysis = async (
+    buf: AudioBuffer,
+    opts?: {
+      mode?: ExtractionMode;
+      start?: number;
+      win?: number;
+      minSec?: number;
+      sens?: number;
+    }
+  ) => {
+    const useMode = opts?.mode ?? extractionMode;
+    const useStart = opts?.start ?? startSec;
+    const useWin = opts?.win ?? windowSec;
+    const useMinSec = opts?.minSec ?? minNoteSec;
+    const useSens = opts?.sens ?? sensitivity;
+
     setIsAnalyzing(true);
     setError(null);
     try {
       const res = await analyzeAudioBufferToMelody(buf, {
-        minNoteSec: minSec,
-        sensitivity: sens,
-        maxDurationSec: 90,
+        mode: useMode,
+        startSec: useStart,
+        maxDurationSec: useWin,
+        minNoteSec: useMinSec,
+        sensitivity: useSens,
         onProgress: (pct, stage) => setProgress({ pct, stage }),
       });
       setAnalysis(res);
+      setEditableRawNotes(res.rawNotes);
       setBpm(res.estimatedBpm);
       const fit = findBestTransposition(res.rawNotes, ocarinaType, ocarinaKey);
       setTranspose(fit.bestShift);
@@ -97,7 +150,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
       setError(
         err instanceof Error
           ? err.message
-          : 'Could not analyze audio buffer. Try a clearer solo melody.'
+          : 'Could not analyze audio buffer. Try switching Extraction Mode or lowering Noise Gate.'
       );
     } finally {
       setIsAnalyzing(false);
@@ -110,16 +163,20 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     setFileName(file.name);
     const cleanTitle = file.name.replace(/\.[^/.]+$/, '').replace(/[_-]+/g, ' ');
     setSongTitle(cleanTitle);
+    setStartSec(0);
 
     try {
+      setIsAnalyzing(true);
+      setProgress({ pct: 2, stage: `Decoding ${file.name}...` });
       const arrayBuf = await file.arrayBuffer();
-      const ctx = getAudioContext();
-      const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
+      const decoded = await decodeAudioSafely(arrayBuf);
       setAudioBuffer(decoded);
-      await runAnalysis(decoded, minNoteSec, sensitivity);
-    } catch {
+      await runAnalysis(decoded, { mode: extractionMode, start: 0 });
+    } catch (err) {
+      setIsAnalyzing(false);
+      const msg = err instanceof Error ? err.message : 'Unsupported audio codec';
       setError(
-        'Could not decode this audio file. Please try an MP3, WAV, M4A, or OGG file.'
+        `Could not decode "${file.name}" (${msg}). Please try a standard MP3, WAV, M4A, or OGG file.`
       );
     }
   };
@@ -130,31 +187,31 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     const blob = createSampleMelodyAudioBlob();
     setFileName('sample-folk-melody.wav');
     setSongTitle('Sample Folk Melody (Demo)');
+    setStartSec(0);
+    setExtractionMode('solo');
     const arrayBuf = await blob.arrayBuffer();
-    const ctx = getAudioContext();
-    const decoded = await ctx.decodeAudioData(arrayBuf);
+    const decoded = await decodeAudioSafely(arrayBuf);
     setAudioBuffer(decoded);
-    await runAnalysis(decoded, minNoteSec, sensitivity);
+    await runAnalysis(decoded, { mode: 'solo', start: 0 });
   };
 
-  // Re-evaluate transposition fit when ocarinaType or ocarinaKey changes
   const bestFitInfo = useMemo(() => {
-    if (!analysis) return null;
-    return findBestTransposition(analysis.rawNotes, ocarinaType, ocarinaKey);
-  }, [analysis, ocarinaType, ocarinaKey]);
+    if (editableRawNotes.length === 0) return null;
+    return findBestTransposition(editableRawNotes, ocarinaType, ocarinaKey);
+  }, [editableRawNotes, ocarinaType, ocarinaKey]);
 
   const previewSong = useMemo(() => {
     if (!analysis) return null;
     return convertRawNotesToSong({
       title: songTitle || 'Converted MP3 Melody',
-      rawNotes: analysis.rawNotes,
+      rawNotes: editableRawNotes,
       bpm,
       transposeSemitones: transpose,
       foldOutOfRange,
       ocarinaType,
       ocarinaKey,
     });
-  }, [analysis, songTitle, bpm, transpose, foldOutOfRange, ocarinaType, ocarinaKey]);
+  }, [analysis, editableRawNotes, songTitle, bpm, transpose, foldOutOfRange, ocarinaType, ocarinaKey]);
 
   const { minMidi, maxMidi } = getPlayableRange(ocarinaType, ocarinaKey);
   const inRangeFinalCount = previewSong
@@ -177,7 +234,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     src.buffer = audioBuffer;
     src.connect(ctx.destination);
     src.onended = () => setPlayingKind('none');
-    src.start(0, 0, Math.min(30, audioBuffer.duration));
+    src.start(0, startSec, Math.min(windowSec, audioBuffer.duration - startSec));
     origSourceRef.current = src;
     setPlayingKind('original');
   };
@@ -191,7 +248,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     stopPlayback();
     setPlayingKind('ocarina');
     const secPerBeat = 60 / bpm;
-    const notesToPlay = previewSong.notes.slice(0, 80);
+    const notesToPlay = previewSong.notes.slice(0, 100);
     notesToPlay.forEach((n, idx) => {
       const delayMs = n.startBeat * secPerBeat * 1000;
       const durSec = Math.max(0.14, n.durationBeats * secPerBeat * 0.88);
@@ -206,6 +263,12 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     });
   };
 
+  const removeRawNoteAt = (idx: number) => {
+    setEditableRawNotes((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const totalDur = audioBuffer?.duration ?? 0;
+
   return (
     <div className="space-y-5">
       {/* Header & Upload Dropzone */}
@@ -217,8 +280,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
               MP3-to-Ocarina Music Scroll Converter
             </h2>
             <p className="text-xs sm:text-sm text-[#6E5D55] mt-0.5">
-              100% private in-browser pitch extraction. Converts solo melodies, vocals, flutes, or
-              piano MP3/WAV files into playable ocarina scrolls.
+              Extracts singing vocals or solo instrument melodies in-browser and maps them onto playable ocarina fingerings.
             </p>
           </div>
           <button
@@ -231,11 +293,71 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
           </button>
         </div>
 
+        {/* Extraction Mode Selector */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <button
+            type="button"
+            onClick={() => {
+              setExtractionMode('vocal');
+              if (audioBuffer) runAnalysis(audioBuffer, { mode: 'vocal' });
+            }}
+            className={`p-3 rounded-xl border text-left transition cursor-pointer flex items-start gap-3 ${
+              extractionMode === 'vocal'
+                ? 'bg-[#FCEEE9] border-[#C2593F]'
+                : 'bg-[#FAF6F0] border-[#E6DDD0] hover:border-[#C2593F]/50'
+            }`}
+          >
+            <Mic2
+              className={`w-5 h-5 shrink-0 mt-0.5 ${
+                extractionMode === 'vocal' ? 'text-[#C2593F]' : 'text-[#6E5D55]'
+              }`}
+            />
+            <div>
+              <div className="text-xs sm:text-sm font-bold text-[#2C221E]">
+                Song / Voice Focus (Recommended for MP3s)
+              </div>
+              <div className="text-[11px] text-[#6E5D55] mt-0.5">
+                Isolates center vocal range (155Hz–2.2kHz), reduces drums/bass, and tracks lead voice melody.
+              </div>
+            </div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setExtractionMode('solo');
+              if (audioBuffer) runAnalysis(audioBuffer, { mode: 'solo' });
+            }}
+            className={`p-3 rounded-xl border text-left transition cursor-pointer flex items-start gap-3 ${
+              extractionMode === 'solo'
+                ? 'bg-[#FCEEE9] border-[#C2593F]'
+                : 'bg-[#FAF6F0] border-[#E6DDD0] hover:border-[#C2593F]/50'
+            }`}
+          >
+            <Music
+              className={`w-5 h-5 shrink-0 mt-0.5 ${
+                extractionMode === 'solo' ? 'text-[#C2593F]' : 'text-[#6E5D55]'
+              }`}
+            />
+            <div>
+              <div className="text-xs sm:text-sm font-bold text-[#2C221E]">
+                Solo Instrument / Clean Voice
+              </div>
+              <div className="text-[11px] text-[#6E5D55] mt-0.5">
+                High-precision pitch tracking for solo flute, piano, ocarina, whistling, or acapella.
+              </div>
+            </div>
+          </button>
+        </div>
+
         <input
           ref={fileInputRef}
           type="file"
           accept="audio/*,.mp3,.wav,.m4a,.ogg,.aac"
           className="hidden"
+          onClick={(e) => {
+            (e.target as HTMLInputElement).value = '';
+          }}
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (f) handleFileChosen(f);
@@ -256,10 +378,10 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
             {fileName ? <FileAudio className="w-6 h-6" /> : <Upload className="w-6 h-6" />}
           </div>
           <div className="font-bold text-sm sm:text-base text-[#2C221E]">
-            {fileName ? `Loaded: ${fileName}` : 'Tap or Drop an MP3 / WAV / M4A File Here'}
+            {fileName ? `Loaded: ${fileName} (Tap to choose another)` : 'Tap or Drop an MP3 / WAV / M4A File Here'}
           </div>
           <p className="text-xs text-[#6E5D55] mt-1">
-            Tip: Solo melodies, vocals, whistling, or acoustic recordings give the cleanest tabs (up to 90s analyzed).
+            Runs 100% locally in your browser — works on phone and desktop with no file upload limits.
           </p>
         </div>
 
@@ -288,7 +410,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
       {/* Analysis Result & Smart Ocarina Compatibility Studio */}
       {analysis && previewSong && (
         <div className="space-y-5">
-          {/* Waveform + Title + Audio Compare */}
+          {/* Waveform + Section Picker + Audio Compare */}
           <div className="bg-white rounded-2xl border border-[#E6DDD0] p-4 sm:p-5 shadow-xs space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex-1">
@@ -337,15 +459,69 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
               </div>
             </div>
 
-            {/* Waveform Bars */}
-            <div className="h-14 bg-[#FAF6F0] rounded-xl border border-[#E6DDD0] px-2 flex items-center gap-[2px] overflow-hidden">
-              {analysis.waveformPeaks.map((p, idx) => (
-                <div
-                  key={idx}
-                  className="flex-1 bg-[#C2593F]/75 rounded-full"
-                  style={{ height: `${Math.max(8, Math.round(p * 100))}%` }}
-                />
-              ))}
+            {/* Full-track Waveform with Highlighted Analyzed Section */}
+            <div className="space-y-2">
+              <div className="h-16 bg-[#FAF6F0] rounded-xl border border-[#E6DDD0] px-2 relative flex items-center gap-[2px] overflow-hidden">
+                {totalDur > 0 && (
+                  <div
+                    className="absolute top-0 bottom-0 bg-[#C2593F]/12 border-x border-[#C2593F]/40 pointer-events-none"
+                    style={{
+                      left: `${(analysis.analyzedStartSec / totalDur) * 100}%`,
+                      width: `${Math.min(
+                        100,
+                        (analysis.analyzedDurationSec / totalDur) * 100
+                      )}%`,
+                    }}
+                  />
+                )}
+                {analysis.waveformPeaks.map((p, idx) => (
+                  <div
+                    key={idx}
+                    className="flex-1 bg-[#C2593F]/75 rounded-full relative z-10"
+                    style={{ height: `${Math.max(8, Math.round(p * 100))}%` }}
+                  />
+                ))}
+              </div>
+
+              {/* Section / Chorus Picker when track > 30s */}
+              {totalDur > 25 && (
+                <div className="flex flex-wrap items-center justify-between gap-3 bg-[#FAF6F0] border border-[#E6DDD0] rounded-xl px-3 py-2 text-xs">
+                  <div className="flex items-center gap-2 flex-1 min-w-[200px]">
+                    <span className="font-semibold text-[#6E5D55] shrink-0">
+                      Start Time ({formatTime(startSec)} / {formatTime(totalDur)}):
+                    </span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={Math.max(0, Math.floor(totalDur - 5))}
+                      value={startSec}
+                      onChange={(e) => setStartSec(Number(e.target.value))}
+                      className="flex-1 accent-[#C2593F]"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[#6E5D55]">Length:</span>
+                    {[30, 60, 90].map((w) => (
+                      <button
+                        key={w}
+                        onClick={() => setWindowSec(w)}
+                        className={`px-2 py-0.5 rounded font-bold cursor-pointer ${
+                          windowSec === w ? 'bg-[#C2593F] text-white' : 'bg-white text-[#6E5D55]'
+                        }`}
+                      >
+                        {w}s
+                      </button>
+                    ))}
+                    <button
+                      onClick={() => audioBuffer && runAnalysis(audioBuffer)}
+                      disabled={isAnalyzing}
+                      className="px-2.5 py-1 rounded-lg bg-[#2C221E] text-white font-semibold cursor-pointer"
+                    >
+                      Analyze Section
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Ocarina Compatibility & Cleanup Controls */}
@@ -378,7 +554,11 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
                           onClick={() => setTranspose(bestFitInfo.bestShift)}
                           className="ml-2 text-[#C2593F] underline cursor-pointer"
                         >
-                          Use Best ({bestFitInfo.bestShift >= 0 ? `+${bestFitInfo.bestShift}` : bestFitInfo.bestShift})
+                          Use Best (
+                          {bestFitInfo.bestShift >= 0
+                            ? `+${bestFitInfo.bestShift}`
+                            : bestFitInfo.bestShift}
+                          )
                         </button>
                       )}
                     </span>
@@ -386,7 +566,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
                   <input
                     type="range"
                     min={-12}
-                    max={12}
+                    max={18}
                     value={transpose}
                     onChange={(e) => setTranspose(Number(e.target.value))}
                     className="w-full accent-[#C2593F]"
@@ -413,7 +593,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
                     Extraction Cleanup & Tempo
                   </span>
                   <button
-                    onClick={() => audioBuffer && runAnalysis(audioBuffer, minNoteSec, sensitivity)}
+                    onClick={() => audioBuffer && runAnalysis(audioBuffer)}
                     disabled={isAnalyzing}
                     className="text-xs font-bold text-[#C2593F] hover:underline cursor-pointer"
                   >
@@ -457,12 +637,12 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
 
                 <div>
                   <div className="flex justify-between text-[11px] text-[#6E5D55] mb-1">
-                    <span>Noise Gate Threshold (higher = fewer stray notes)</span>
+                    <span>Voice Gate (lower = catches softer singing)</span>
                     <span className="font-mono-tech font-bold">{Math.round(sensitivity * 100)}%</span>
                   </div>
                   <input
                     type="range"
-                    min={0.03}
+                    min={0.01}
                     max={0.22}
                     step={0.01}
                     value={sensitivity}
@@ -482,7 +662,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
                   Generated Ocarina Scroll Preview ({previewSong.notes.length} notes)
                 </h3>
                 <p className="text-xs text-[#6E5D55]">
-                  Save this scroll to open it in Dual View (Tab Scroll + Rhythm Highway) with live mic grading!
+                  Tap a note card to hear it, or tap its trash icon to remove unwanted blips before opening in Tutor.
                 </p>
               </div>
               <button
@@ -496,24 +676,56 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
             </div>
 
             {previewSong.notes.length === 0 ? (
-              <div className="text-sm text-[#6E5D55] bg-[#FAF6F0] rounded-xl p-4 text-center">
-                No clear pitched notes detected. Try lowering the Noise Gate Threshold and clicking{' '}
-                <strong>Re-Analyze</strong>.
+              <div className="text-sm text-[#6E5D55] bg-[#FAF6F0] rounded-xl p-4 space-y-2 text-center">
+                <p>No vocal/melody notes detected in this section with current gate settings.</p>
+                <div className="flex flex-wrap justify-center gap-2">
+                  <button
+                    onClick={() => {
+                      const nextSens = 0.02;
+                      setSensitivity(nextSens);
+                      if (audioBuffer) runAnalysis(audioBuffer, { sens: nextSens });
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-[#C2593F] text-white text-xs font-bold cursor-pointer"
+                  >
+                    Lower Voice Gate (2%) & Retry
+                  </button>
+                  <button
+                    onClick={() => {
+                      const nextMode: ExtractionMode = extractionMode === 'vocal' ? 'solo' : 'vocal';
+                      setExtractionMode(nextMode);
+                      if (audioBuffer) runAnalysis(audioBuffer, { mode: nextMode, sens: 0.03 });
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-white border border-[#E6DDD0] text-xs font-bold text-[#2C221E] cursor-pointer"
+                  >
+                    Switch to {extractionMode === 'vocal' ? 'Solo Instrument' : 'Song / Voice'} Mode
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="flex gap-2 overflow-x-auto pb-2">
-                {previewSong.notes.map((n) => {
+                {previewSong.notes.map((n, idx) => {
                   const fing = getFingeringForMidi(n.midi, ocarinaType, ocarinaKey);
                   return (
                     <div
                       key={n.id}
                       onClick={() => playOcarinaNote(n.midi, 0.35)}
-                      className={`shrink-0 rounded-xl border p-2 flex flex-col items-center cursor-pointer min-w-[76px] ${
+                      className={`relative group shrink-0 rounded-xl border p-2 flex flex-col items-center cursor-pointer min-w-[78px] ${
                         n.outOfRange
                           ? 'bg-red-50 border-red-300'
                           : 'bg-[#FAF6F0] border-[#E6DDD0] hover:border-[#C2593F]'
                       }`}
                     >
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeRawNoteAt(idx);
+                        }}
+                        title="Remove note"
+                        className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-white border border-[#E6DDD0] text-[#6E5D55] hover:text-red-600 flex items-center justify-center opacity-80 sm:opacity-0 sm:group-hover:opacity-100 transition"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
                       <span className="font-mono-tech text-xs font-bold text-[#2C221E]">
                         {midiToNoteName(n.midi)}
                       </span>
