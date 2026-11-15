@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-parchment: #FAF6F0;
+    --surface-card: #FFFFFF;
+    --surface-warm: #F3ECE1;
+    --clay-primary: #C2593F;
+    --clay-deep: #9E412B;
+    --clay-soft: #FCEEE9;
+    --sage-accent: #3D6B58;
+    --espresso-text: #2C221E;
+    --walnut-muted: #6E5D55;
+    --border-warm: #E6DDD0;
+  }
+
+  html,
+  body {
+    background-color: var(--bg-parchment);
+    color: var(--espresso-text);
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior-y: contain;
+  }
+
+  h1, h2, h3, .font-serif-display {
+    font-family: 'Fraunces', Georgia, Cambria, 'Times New Roman', serif;
+  }
+
+  .font-mono-tech {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+}
+
+/* Custom subtle warm scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #F3ECE1;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #D4C5B3;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #B8A58F;
+}
+
+.safe-pb {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+}

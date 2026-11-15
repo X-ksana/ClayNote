@@ -1,0 +1,18 @@
+{
+  "name": "ClayNote Ocarina Studio",
+  "short_name": "ClayNote",
+  "description": "Learn ocarina with live microphone pitch feedback, 12/6/4-hole fingerings, scales, and MP3-to-scroll analysis.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FAF6F0",
+  "theme_color": "#C2593F",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/ocarina-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
