@@ -552,7 +552,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
                   : 'Tap or Drop an MP3 / WAV / M4A File Here'}
               </div>
               <p className="text-xs text-[#6E5D55] mt-1">
-                Tip: For full songs with vocals (like 牵丝戏.mp3), keep <strong>Song / Voice Focus</strong> ON and pick the verse/chorus section below.
+                Tip: For full songs with vocals, keep <strong>Song / Voice Focus</strong> ON and pick the verse/chorus section below.
               </p>
             </div>
           </>
