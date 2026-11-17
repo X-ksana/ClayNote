@@ -3,6 +3,7 @@ import { OcarinaKey, OcarinaType, Song, SongNote } from '../types/ocarina';
 import { detectPitchYIN } from './pitchDetector';
 
 export type ExtractionMode = 'vocal' | 'solo';
+export type VocalRegister = 'auto' | 'female' | 'male';
 
 export interface RawExtractedNote {
   midi: number;
@@ -13,23 +14,22 @@ export interface RawExtractedNote {
 
 export interface AnalysisConfig {
   mode?: ExtractionMode;
-  /** Minimum note duration in seconds (default 0.13s) */
+  vocalRegister?: VocalRegister;
+  /** Minimum note duration in seconds (default 0.16s for playable ocarina phrasing) */
   minNoteSec?: number;
-  /** Sensitivity 0.02..0.25 (lower = captures quieter notes, higher = stricter gate) */
+  /** Sensitivity 0.01..0.25 (lower = catches quieter singing, higher = stricter gate) */
   sensitivity?: number;
   /** Start offset in seconds inside the audio file */
   startSec?: number;
   /** Max audio seconds to analyze from startSec (default 60s) */
   maxDurationSec?: number;
-  /** Vocal pitch range bounds in MIDI (default 48..88 = C3..E6) */
-  minMidi?: number;
-  maxMidi?: number;
   onProgress?: (pct: number, stage: string) => void;
 }
 
 export interface AnalysisResult {
   rawNotes: RawExtractedNote[];
   estimatedBpm: number;
+  detectedKeyName: string;
   durationSec: number;
   analyzedStartSec: number;
   analyzedDurationSec: number;
@@ -37,15 +37,17 @@ export interface AnalysisResult {
   modeUsed: ExtractionMode;
 }
 
+const PITCH_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+// Krumhansl-Schmuckler key profiles
+const MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
 function median(arr: number[]): number {
   const sorted = [...arr].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
-/**
- * Computes full-track waveform peaks for visual timeline scrubbing.
- */
 export function computeTrackWaveform(audioBuffer: AudioBuffer, barCount = 120): number[] {
   const peaks: number[] = [];
   const ch0 = audioBuffer.getChannelData(0);
@@ -69,10 +71,6 @@ export function computeTrackWaveform(audioBuffer: AudioBuffer, barCount = 120): 
   return peaks;
 }
 
-/**
- * Simple 2nd-order Biquad filter (High-pass or Low-pass) to isolate vocal/melody frequencies
- * and suppress kick drums, bass guitar (<150Hz), and hi-hats/cymbals (>2200Hz).
- */
 function applyBiquadFilter(
   samples: Float32Array,
   sampleRate: number,
@@ -120,12 +118,8 @@ function applyBiquadFilter(
   return out;
 }
 
-/**
- * In-place Radix-2 Cooley-Tukey FFT (length N must be power of 2).
- */
 function fftMagnitude(real: Float32Array, imag: Float32Array, magOut: Float32Array): void {
   const n = real.length;
-  // Bit-reversal permutation
   let j = 0;
   for (let i = 0; i < n; i++) {
     if (i < j) {
@@ -140,7 +134,6 @@ function fftMagnitude(real: Float32Array, imag: Float32Array, magOut: Float32Arr
     j += m;
   }
 
-  // Butterfly stages
   for (let size = 2; size <= n; size <<= 1) {
     const half = size >> 1;
     const step = (-2 * Math.PI) / size;
@@ -171,25 +164,72 @@ function fftMagnitude(real: Float32Array, imag: Float32Array, magOut: Float32Arr
   }
 }
 
+function downsample2x(arr: Float32Array): Float32Array {
+  const len = Math.floor(arr.length / 2);
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    out[i] = (arr[i * 2] + arr[i * 2 + 1]) * 0.5;
+  }
+  return out;
+}
+
+function detectDominantKey(pcWeights: Float64Array): { rootPc: number; isMinor: boolean; name: string } {
+  let bestScore = -Infinity;
+  let bestRoot = 0;
+  let bestMinor = false;
+
+  for (let root = 0; root < 12; root++) {
+    let majScore = 0;
+    let minScore = 0;
+    for (let i = 0; i < 12; i++) {
+      const pc = (root + i) % 12;
+      majScore += pcWeights[pc] * MAJOR_PROFILE[i];
+      minScore += pcWeights[pc] * MINOR_PROFILE[i];
+    }
+    if (majScore > bestScore) {
+      bestScore = majScore;
+      bestRoot = root;
+      bestMinor = false;
+    }
+    if (minScore > bestScore) {
+      bestScore = minScore;
+      bestRoot = root;
+      bestMinor = true;
+    }
+  }
+  return {
+    rootPc: bestRoot,
+    isMinor: bestMinor,
+    name: `${PITCH_NAMES[bestRoot]} ${bestMinor ? 'Minor' : 'Major'}`,
+  };
+}
+
 /**
- * Extracts dominant singing/lead melody from an MP3/audio buffer using either:
- * - 'vocal': Center-focused + Bandpass (155Hz-2200Hz) + Zero-padded FFT Harmonic Salience + Viterbi contour smoothing
- * - 'solo': Clean monophonic YIN pitch tracking with relaxed threshold + fallback salience
+ * Extracts dominant singing voice or solo instrument melody from an AudioBuffer.
+ * In 'vocal' mode:
+ *  1. Computes stereo Mid & Side channels, performing spectral Mid-Side subtraction
+ *     (|Mid| - 1.15*|Side|) to cancel wide-panned accompaniment (guzheng, guitars, reverb).
+ *  2. Applies 180Hz-2400Hz bandpass to strip kick/bass & cymbals.
+ *  3. Uses zero-padded 4096-pt FFT Harmonic Salience with fundamental-verification
+ *     (preventing octave-down errors) + Krumhansl key-aware Viterbi DP smoothing.
  */
 export async function analyzeAudioBufferToMelody(
   audioBuffer: AudioBuffer,
   config: AnalysisConfig = {}
 ): Promise<AnalysisResult> {
   const mode: ExtractionMode = config.mode ?? 'vocal';
-  const minNoteSec = config.minNoteSec ?? 0.13;
-  const sensitivity = config.sensitivity ?? 0.08;
+  const vocalRegister: VocalRegister = config.vocalRegister ?? 'auto';
+  const minNoteSec = config.minNoteSec ?? 0.16;
+  const sensitivity = config.sensitivity ?? 0.07;
   const startSec = Math.max(0, Math.min(config.startSec ?? 0, Math.max(0, audioBuffer.duration - 1)));
   const maxDurationSec = config.maxDurationSec ?? 60;
-  const minMidiBound = config.minMidi ?? 48; // C3
-  const maxMidiBound = config.maxMidi ?? 88; // E6
   const onProgress = config.onProgress;
 
-  onProgress?.(5, 'Preparing audio channel...');
+  // MIDI bounds tailored to vocal register
+  const minMidiBound = vocalRegister === 'female' ? 55 : vocalRegister === 'male' ? 48 : 53; // G3 / C3 / F3
+  const maxMidiBound = vocalRegister === 'female' ? 86 : vocalRegister === 'male' ? 79 : 86; // D6 / G5 / D6
+
+  onProgress?.(4, 'Preparing audio channels...');
 
   const sampleRate = audioBuffer.sampleRate;
   const startSample = Math.floor(startSec * sampleRate);
@@ -202,6 +242,7 @@ export async function analyzeAudioBufferToMelody(
     return {
       rawNotes: [],
       estimatedBpm: 100,
+      detectedKeyName: 'C Major',
       durationSec: audioBuffer.duration,
       analyzedStartSec: startSec,
       analyzedDurationSec: segSamples / sampleRate,
@@ -210,74 +251,70 @@ export async function analyzeAudioBufferToMelody(
     };
   }
 
-  const mono = new Float32Array(segSamples);
   const numChannels = audioBuffer.numberOfChannels;
+  let midRaw: Float32Array = new Float32Array(segSamples);
+  let sideRaw: Float32Array | null = null;
 
-  if (numChannels >= 2 && mode === 'vocal') {
-    // Center-vocal weighted mix: boost mid (L+R) slightly over stereo side content
+  if (numChannels >= 2) {
     const left = audioBuffer.getChannelData(0);
     const right = audioBuffer.getChannelData(1);
-    for (let i = 0; i < segSamples; i++) {
-      const l = left[startSample + i];
-      const r = right[startSample + i];
-      const mid = (l + r) * 0.5;
-      const side = Math.abs(l - r) * 0.5;
-      // Attenuate strongly wide-panned accompaniment slightly while preserving center vocals
-      const centerWeight = Math.abs(mid) / (Math.abs(mid) + side * 0.65 + 1e-5);
-      mono[i] = mid * (0.45 + 0.55 * centerWeight);
-    }
-  } else {
-    for (let ch = 0; ch < numChannels; ch++) {
-      const data = audioBuffer.getChannelData(ch);
+    if (mode === 'vocal') {
+      sideRaw = new Float32Array(segSamples);
       for (let i = 0; i < segSamples; i++) {
-        mono[i] += data[startSample + i] / numChannels;
+        const l = left[startSample + i];
+        const r = right[startSample + i];
+        midRaw[i] = (l + r) * 0.5;
+        sideRaw[i] = (l - r) * 0.5;
+      }
+    } else {
+      for (let i = 0; i < segSamples; i++) {
+        midRaw[i] = (left[startSample + i] + right[startSample + i]) * 0.5;
       }
     }
+  } else {
+    const ch0 = audioBuffer.getChannelData(0);
+    midRaw.set(ch0.subarray(startSample, startSample + segSamples));
   }
 
-  // Downsample cleanly to ~22050Hz (or ~16k-24k) for crisp vocal analysis & speed
-  let workSamples = mono;
   let workRate = sampleRate;
   if (sampleRate >= 40000) {
-    const factor = 2;
-    const newLen = Math.floor(mono.length / factor);
-    const down = new Float32Array(newLen);
-    for (let i = 0; i < newLen; i++) {
-      down[i] = (mono[i * 2] + mono[i * 2 + 1]) * 0.5;
-    }
-    workSamples = down;
-    workRate = sampleRate / factor;
+    midRaw = downsample2x(midRaw);
+    if (sideRaw) sideRaw = downsample2x(sideRaw);
+    workRate = sampleRate / 2;
   }
 
   const waveformPeaks = computeTrackWaveform(audioBuffer);
 
-  // In vocal mode, isolate 155Hz–2200Hz to strip kick/bass & cymbals
-  let filteredSamples: Float32Array = workSamples;
+  // Bandpass filter for vocal mode (185Hz highpass kills bass/cello/kick, 2400Hz lowpass kills cymbals)
+  let midProc: Float32Array = midRaw;
+  let sideProc: Float32Array | null = sideRaw;
   if (mode === 'vocal') {
-    onProgress?.(10, 'Isolating vocal & lead melody band (155Hz–2.2kHz)...');
-    const hp = applyBiquadFilter(workSamples, workRate, 'highpass', 155, 0.8);
-    filteredSamples = applyBiquadFilter(hp, workRate, 'lowpass', 2200, 0.8);
+    onProgress?.(10, 'Filtering bass & percussion (185Hz–2.4kHz)...');
+    const hpCutoff = vocalRegister === 'male' ? 135 : 185;
+    midProc = applyBiquadFilter(applyBiquadFilter(midRaw, workRate, 'highpass', hpCutoff, 0.8), workRate, 'lowpass', 2400, 0.8);
+    if (sideRaw) {
+      sideProc = applyBiquadFilter(applyBiquadFilter(sideRaw, workRate, 'highpass', hpCutoff, 0.8), workRate, 'lowpass', 2400, 0.8);
+    }
   }
 
-  const hopSize = Math.floor(workRate * 0.025); // 25ms steps
-  const windowSize = 2048; // ~93ms window at 22050Hz
-  const fftSize = 4096; // zero-padded for 5.38Hz bin spacing!
-  const totalFrames = Math.max(1, Math.floor((filteredSamples.length - windowSize) / hopSize));
+  const hopSize = Math.floor(workRate * 0.025); // 25ms hop
+  const windowSize = 2048; // ~93ms window
+  const fftSize = 4096; // ~5.38Hz bin spacing
+  const totalFrames = Math.max(1, Math.floor((midProc.length - windowSize) / hopSize));
 
-  // Precompute Hann window
   const hann = new Float32Array(windowSize);
   for (let i = 0; i < windowSize; i++) {
     hann[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (windowSize - 1)));
   }
 
-  // First pass: compute frame RMS values so we have an adaptive energy gate
+  // Compute frame RMS energy for silence gating
   const frameRms = new Float32Array(totalFrames);
   const sortedRms: number[] = [];
   for (let f = 0; f < totalFrames; f++) {
     const start = f * hopSize;
     let sq = 0;
     for (let i = 0; i < windowSize; i += 2) {
-      const v = filteredSamples[start + i];
+      const v = midProc[start + i];
       sq += v * v;
     }
     const rms = Math.sqrt(sq / (windowSize / 2));
@@ -286,9 +323,7 @@ export async function analyzeAudioBufferToMelody(
   }
   sortedRms.sort((a, b) => a - b);
   const peakRms = sortedRms[Math.floor(sortedRms.length * 0.95)] ?? 0.1;
-
-  // Gate only true silence / ultra-quiet background (never gate out continuous music verses!)
-  const rmsGate = Math.max(0.0015, peakRms * (sensitivity * 0.5));
+  const rmsGate = Math.max(0.0015, peakRms * (sensitivity * 0.55));
 
   interface FrameCandidate {
     time: number;
@@ -300,25 +335,33 @@ export async function analyzeAudioBufferToMelody(
 
   const numMidiBins = maxMidiBound - minMidiBound + 1;
   const frames: FrameCandidate[] = [];
+  const pcHistogram = new Float64Array(12);
 
   if (mode === 'vocal') {
-    const real = new Float32Array(fftSize);
-    const imag = new Float32Array(fftSize);
-    const mag = new Float32Array(fftSize / 2);
+    const realM = new Float32Array(fftSize);
+    const imagM = new Float32Array(fftSize);
+    const magM = new Float32Array(fftSize / 2);
+
+    const realS = new Float32Array(fftSize);
+    const imagS = new Float32Array(fftSize);
+    const magS = new Float32Array(fftSize / 2);
+
+    const magVocal = new Float32Array(fftSize / 2);
     const binHz = workRate / fftSize;
 
-    // Precompute harmonic bin lookups & vocal weight for each MIDI candidate
-    const midiHarmonicBins: Array<{ bins: number[]; vocalWeight: number }> = [];
+    // Precompute harmonic bins & vocal register weighting
+    const sweetCenter = vocalRegister === 'female' ? 71 : vocalRegister === 'male' ? 62 : 69; // B4 / D4 / A4
+    const midiCandidates: Array<{ bins: number[]; vocalWeight: number }> = [];
     for (let m = minMidiBound; m <= maxMidiBound; m++) {
       const f0 = midiToFreq(m);
       const bins = [1, 2, 3, 4].map((h) => (f0 * h) / binHz);
-      // Gentle vocal melody preference around C4 (60) .. G5 (79)
-      const distFromSweetSpot = Math.abs(m - 68) / 14;
-      const vocalWeight = 1.0 - 0.18 * Math.min(1.5, distFromSweetSpot * distFromSweetSpot);
-      midiHarmonicBins.push({ bins, vocalWeight });
+      const dist = Math.abs(m - sweetCenter) / 14;
+      const vocalWeight = 1.0 - 0.15 * Math.min(1.4, dist * dist);
+      midiCandidates.push({ bins, vocalWeight });
     }
 
-    const harmonicWeights = [1.0, 0.72, 0.42, 0.22];
+    const minBandBin = Math.floor(170 / binHz);
+    const maxBandBin = Math.min(magVocal.length - 2, Math.ceil(2500 / binHz));
 
     for (let f = 0; f < totalFrames; f++) {
       const start = f * hopSize;
@@ -327,118 +370,120 @@ export async function analyzeAudioBufferToMelody(
       if (rms < rmsGate) {
         frames.push({ time: start / workRate, midi: null, clarity: 0, rms, scores: null });
       } else {
-        real.fill(0);
-        imag.fill(0);
+        realM.fill(0);
+        imagM.fill(0);
         for (let i = 0; i < windowSize; i++) {
-          real[i] = filteredSamples[start + i] * hann[i];
+          realM[i] = midProc[start + i] * hann[i];
         }
-        fftMagnitude(real, imag, mag);
+        fftMagnitude(realM, imagM, magM);
 
-        // Compute total spectral energy in melody band for normalization (rejects broadband drums!)
-        const minBin = Math.floor(140 / binHz);
-        const maxBin = Math.min(mag.length - 2, Math.ceil(2400 / binHz));
-        let bandEnergy = 1e-6;
-        for (let b = minBin; b <= maxBin; b++) {
-          bandEnergy += mag[b];
+        if (sideProc) {
+          realS.fill(0);
+          imagS.fill(0);
+          for (let i = 0; i < windowSize; i++) {
+            realS[i] = sideProc[start + i] * hann[i];
+          }
+          fftMagnitude(realS, imagS, magS);
+          for (let b = minBandBin; b <= maxBandBin; b++) {
+            // Spectral Mid-Side subtraction suppresses stereo instruments & reverb
+            magVocal[b] = Math.max(0, magM[b] - 1.15 * magS[b]);
+          }
+        } else {
+          for (let b = minBandBin; b <= maxBandBin; b++) {
+            magVocal[b] = magM[b];
+          }
         }
-        const avgBinMag = bandEnergy / Math.max(1, maxBin - minBin + 1);
+
+        let bandSum = 1e-6;
+        for (let b = minBandBin; b <= maxBandBin; b++) {
+          bandSum += magVocal[b];
+        }
+        const avgBin = bandSum / Math.max(1, maxBandBin - minBandBin + 1);
 
         const scores = new Float32Array(numMidiBins);
         let bestIdx = 0;
         let bestScore = -Infinity;
-        let secondBest = -Infinity;
+
+        const peakAt = (bFloat: number) => {
+          const b = Math.round(bFloat);
+          if (b < 2 || b >= magVocal.length - 2) return 0;
+          return Math.max(magVocal[b - 1], magVocal[b], magVocal[b + 1]);
+        };
 
         for (let idx = 0; idx < numMidiBins; idx++) {
-          const { bins, vocalWeight } = midiHarmonicBins[idx];
-          let sum = 0;
-          for (let h = 0; h < bins.length; h++) {
-            const bFloat = bins[h];
-            const bInt = Math.round(bFloat);
-            if (bInt >= 2 && bInt < mag.length - 2) {
-              // Local peak around bin to handle vibrato/tuning slight offsets
-              const localMax = Math.max(mag[bInt - 1], mag[bInt], mag[bInt + 1]);
-              sum += localMax * harmonicWeights[h];
-            }
+          const { bins, vocalWeight } = midiCandidates[idx];
+          const h1 = peakAt(bins[0]);
+          const h2 = peakAt(bins[1]);
+          const h3 = peakAt(bins[2]);
+          const h4 = peakAt(bins[3]);
+
+          // Fundamental presence requirement: kills octave-down ghost picks!
+          // If 2*f0 is huge while f0 AND 3*f0 are weak, true pitch is an octave higher (2*f0).
+          const maxHarm = Math.max(h1, h2, h3, 1e-6);
+          const fundRatio = h1 / maxHarm;
+          const oddSupport = (h1 + h3) / (h2 + h4 + 1e-6);
+          let octaveGate = 1.0;
+          if (fundRatio < 0.22 && oddSupport < 0.55) {
+            octaveGate = 0.25;
+          } else if (fundRatio < 0.35) {
+            octaveGate = 0.65;
           }
-          // Sub-octave suppression: check 0.5 * f0 to avoid octave-down error
-          const halfBin = Math.round(bins[0] * 0.5);
-          const halfEnergy =
-            halfBin >= 2 && halfBin < mag.length - 1
-              ? Math.max(mag[halfBin - 1], mag[halfBin], mag[halfBin + 1])
-              : 0;
-          const score = ((sum - halfEnergy * 0.35) / (avgBinMag * 2.4)) * vocalWeight;
-          scores[idx] = score;
-          if (score > bestScore) {
-            secondBest = bestScore;
-            bestScore = score;
+
+          // Sub-octave suppression
+          const halfH = peakAt(bins[0] * 0.5);
+          const rawSalience =
+            (h1 * 1.15 + h2 * 0.65 + h3 * 0.4 + h4 * 0.2 - halfH * 0.3) / (avgBin * 2.2);
+
+          const logScore = Math.log1p(Math.max(0, rawSalience)) * octaveGate * vocalWeight;
+          scores[idx] = logScore;
+
+          if (logScore > bestScore) {
+            bestScore = logScore;
             bestIdx = idx;
-          } else if (score > secondBest) {
-            secondBest = score;
           }
         }
 
-        // Harmonic tonality check: pitched voice stands cleanly above flat percussion noise
-        const tonality = Math.min(1, Math.max(0, (bestScore - 1.05) / 2.2));
-        const isPitched = bestScore > 1.35;
+        const isPitched = bestScore > 0.72;
+        const bestMidi = minMidiBound + bestIdx;
+        if (isPitched) {
+          pcHistogram[((bestMidi % 12) + 12) % 12] += bestScore;
+        }
 
         frames.push({
           time: start / workRate,
-          midi: isPitched ? minMidiBound + bestIdx : null,
-          clarity: isPitched ? tonality : 0,
+          midi: isPitched ? bestMidi : null,
+          clarity: isPitched ? Math.min(1, bestScore / 2.5) : 0,
           rms,
           scores: isPitched ? scores : null,
         });
       }
 
       if (f % 80 === 0) {
-        const pct = 15 + Math.round((f / totalFrames) * 68);
-        onProgress?.(pct, `Tracking vocal melody (${Math.round((f / totalFrames) * 100)}%)...`);
+        const pct = 15 + Math.round((f / totalFrames) * 65);
+        onProgress?.(pct, `Isolating vocal melody (${Math.round((f / totalFrames) * 100)}%)...`);
         await new Promise((r) => setTimeout(r, 0));
       }
     }
 
-    // Viterbi / Dynamic Programming smoothing across voiced segments to prevent octave/chord jumps
-    onProgress?.(85, 'Smoothing vocal contour...');
-    const dpScores = new Float32Array(numMidiBins);
-    const prevDp = new Float32Array(numMidiBins);
-    const backPtr: Int16Array[] = [];
+    // Detect musical key & give subtle in-key bonus before Viterbi DP smoothing
+    const keyInfo = detectDominantKey(pcHistogram);
+    const scaleOffsets = keyInfo.isMinor ? [0, 2, 3, 5, 7, 8, 10] : [0, 2, 4, 5, 7, 9, 11];
+    const inKeySet = new Set(scaleOffsets.map((o) => (keyInfo.rootPc + o) % 12));
 
     for (let f = 0; f < frames.length; f++) {
-      const fr = frames[f];
-      const ptr = new Int16Array(numMidiBins).fill(-1);
-      if (!fr.scores) {
-        prevDp.fill(0);
-        backPtr.push(ptr);
-        continue;
-      }
-
-      const prevHasScores = f > 0 && frames[f - 1].scores !== null;
-      for (let cur = 0; cur < numMidiBins; cur++) {
-        if (!prevHasScores) {
-          dpScores[cur] = fr.scores[cur];
-          ptr[cur] = cur;
-        } else {
-          let bestPrevScore = -Infinity;
-          let bestPrevIdx = cur;
-          for (let prev = 0; prev < numMidiBins; prev++) {
-            const jump = Math.abs(cur - prev);
-            // Allow smooth steps & musical intervals, penalize erratic huge jumps & octave flips
-            const penalty = jump === 0 ? 0 : jump <= 2 ? 0.12 : jump === 12 ? 0.9 : 0.28 + jump * 0.12;
-            const cand = prevDp[prev] - penalty;
-            if (cand > bestPrevScore) {
-              bestPrevScore = cand;
-              bestPrevIdx = prev;
-            }
-          }
-          dpScores[cur] = bestPrevScore + fr.scores[cur];
-          ptr[cur] = bestPrevIdx;
+      const sc = frames[f].scores;
+      if (!sc) continue;
+      for (let idx = 0; idx < numMidiBins; idx++) {
+        const pc = ((minMidiBound + idx) % 12 + 12) % 12;
+        if (inKeySet.has(pc)) {
+          sc[idx] += 0.28;
         }
       }
-      prevDp.set(dpScores);
-      backPtr.push(ptr);
     }
 
-    // Backtrack each contiguous voiced island
+    onProgress?.(84, `Smoothing contour (${keyInfo.name})...`);
+
+    // Island-by-island Viterbi Dynamic Programming with strong octave/leap stability
     let idxEnd = frames.length - 1;
     while (idxEnd >= 0) {
       if (!frames[idxEnd].scores) {
@@ -449,12 +494,11 @@ export async function analyzeAudioBufferToMelody(
       while (idxStart > 0 && frames[idxStart - 1].scores !== null) {
         idxStart--;
       }
-      // Re-run forward DP cleanly on this island or backtrack from end if we didn't overwrite prevDp:
-      // Let's do a fast local DP per island so prevDp is exact!
       const islandLen = idxEnd - idxStart + 1;
       const localPrev = new Float32Array(numMidiBins);
       const localCur = new Float32Array(numMidiBins);
       const localBack: Int16Array[] = [];
+
       for (let k = 0; k < islandLen; k++) {
         const sc = frames[idxStart + k].scores!;
         const ptr = new Int16Array(numMidiBins);
@@ -467,7 +511,15 @@ export async function analyzeAudioBufferToMelody(
             let bestPI = cur;
             for (let prev = 0; prev < numMidiBins; prev++) {
               const jump = Math.abs(cur - prev);
-              const pen = jump === 0 ? 0 : jump <= 2 ? 0.12 : jump === 12 ? 0.95 : 0.28 + jump * 0.12;
+              // Strong stability against frame-to-frame octave flips and wild accompaniment jumps
+              let pen = 0;
+              if (jump === 0) pen = 0;
+              else if (jump <= 2) pen = 0.25;
+              else if (jump <= 5) pen = 0.65;
+              else if (jump <= 7) pen = 0.95;
+              else if (jump === 12) pen = 2.2;
+              else pen = 1.2 + (jump - 7) * 0.22;
+
               const cand = localPrev[prev] - pen;
               if (cand > bestP) {
                 bestP = cand;
@@ -493,23 +545,29 @@ export async function analyzeAudioBufferToMelody(
       }
       idxEnd = idxStart - 1;
     }
+
+    // Store key name for result
+    var detectedKeyName = keyInfo.name;
   } else {
-    // 'solo' mode: YIN pitch detection with relaxed clarity
+    // 'solo' mode: YIN pitch detection
     const yinWin = 1536;
-    const yinFrames = Math.max(1, Math.floor((filteredSamples.length - yinWin) / hopSize));
+    const yinFrames = Math.max(1, Math.floor((midProc.length - yinWin) / hopSize));
     for (let f = 0; f < yinFrames; f++) {
       const start = f * hopSize;
-      const slice = filteredSamples.subarray(start, start + yinWin);
+      const slice = midProc.subarray(start, start + yinWin);
       const reading = detectPitchYIN(slice, workRate, {
-        minFreq: midiToFreq(minMidiBound) * 0.95,
-        maxFreq: midiToFreq(maxMidiBound) * 1.05,
+        minFreq: midiToFreq(minMidiBound) * 0.9,
+        maxFreq: midiToFreq(maxMidiBound) * 1.1,
         threshold: 0.2,
         rmsThreshold: rmsGate,
       });
 
+      const m = reading.clarity >= 0.45 ? reading.midi : null;
+      if (m !== null) pcHistogram[((m % 12) + 12) % 12] += reading.clarity;
+
       frames.push({
         time: start / workRate,
-        midi: reading.clarity >= 0.45 ? reading.midi : null,
+        midi: m,
         clarity: reading.clarity,
         rms: reading.rms,
         scores: null,
@@ -521,24 +579,25 @@ export async function analyzeAudioBufferToMelody(
         await new Promise((r) => setTimeout(r, 0));
       }
     }
+    var detectedKeyName = detectDominantKey(pcHistogram).name;
   }
 
-  onProgress?.(92, 'Segmenting melody into ocarina notes...');
+  onProgress?.(92, 'Cleaning ornaments & building ocarina notes...');
 
-  // 5-frame median filter to remove single-frame artifacts
+  // 7-frame median filter (~175ms smoothing window) removes quick vibrato/flicker noise
   const smoothedMidi: Array<number | null> = frames.map((fr, idx) => {
     if (fr.midi === null) return null;
     const win: number[] = [];
-    for (let k = Math.max(0, idx - 2); k <= Math.min(frames.length - 1, idx + 2); k++) {
+    for (let k = Math.max(0, idx - 3); k <= Math.min(frames.length - 1, idx + 3); k++) {
       const m = frames[k].midi;
       if (m !== null) win.push(m);
     }
-    if (win.length < 2) return null;
+    if (win.length < 3) return null;
     return Math.round(median(win));
   });
 
   // Segment contiguous pitch regions into discrete musical notes
-  const rawNotes: RawExtractedNote[] = [];
+  let rawNotes: RawExtractedNote[] = [];
   const frameDur = hopSize / workRate;
   let curMidi: number | null = null;
   let curStart = 0;
@@ -568,7 +627,8 @@ export async function analyzeAudioBufferToMelody(
 
     if (m === null) {
       const nextM = i + 1 < frames.length ? smoothedMidi[i + 1] : null;
-      if (curMidi !== null && nextM === curMidi) {
+      const next2M = i + 2 < frames.length ? smoothedMidi[i + 2] : null;
+      if (curMidi !== null && (nextM === curMidi || next2M === curMidi)) {
         curCount++;
         continue;
       }
@@ -579,10 +639,9 @@ export async function analyzeAudioBufferToMelody(
       curClaritySum = frames[i].clarity;
       curCount = 1;
     } else if (m === curMidi) {
-      // Split repeated same-pitch syllables on clear volume re-articulation
       const prevRms = i > 0 ? frames[i - 1].rms : frames[i].rms;
       const prev2Rms = i > 1 ? frames[i - 2].rms : prevRms;
-      if (frames[i].rms > prevRms * 1.55 && prevRms < prev2Rms * 0.72 && t - curStart >= minNoteSec) {
+      if (frames[i].rms > prevRms * 1.6 && prevRms < prev2Rms * 0.7 && t - curStart >= minNoteSec) {
         flushNote(t);
         curMidi = m;
         curStart = t;
@@ -602,19 +661,32 @@ export async function analyzeAudioBufferToMelody(
   }
   flushNote(frames.length * frameDur);
 
+  // Merge tiny same-pitch fragments separated by < 100ms gaps
+  const merged: RawExtractedNote[] = [];
+  for (const n of rawNotes) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.midi === n.midi && n.startSec - (prev.startSec + prev.durationSec) < 0.1) {
+      prev.durationSec = n.startSec + n.durationSec - prev.startSec;
+      prev.clarity = (prev.clarity + n.clarity) * 0.5;
+    } else {
+      merged.push({ ...n });
+    }
+  }
+  rawNotes = merged;
+
   // Estimate BPM from median inter-onset interval
-  let estimatedBpm = 100;
+  let estimatedBpm = 96;
   if (rawNotes.length >= 4) {
     const iois: number[] = [];
     for (let i = 1; i < rawNotes.length; i++) {
       const diff = rawNotes[i].startSec - rawNotes[i - 1].startSec;
-      if (diff >= 0.18 && diff <= 1.5) iois.push(diff);
+      if (diff >= 0.2 && diff <= 1.5) iois.push(diff);
     }
     if (iois.length >= 2) {
       const medIoi = median(iois);
       let bpm = 60 / medIoi;
       while (bpm < 68) bpm *= 2;
-      while (bpm > 152) bpm /= 2;
+      while (bpm > 144) bpm /= 2;
       estimatedBpm = Math.round(bpm);
     }
   }
@@ -623,6 +695,7 @@ export async function analyzeAudioBufferToMelody(
   return {
     rawNotes,
     estimatedBpm,
+    detectedKeyName: detectedKeyName!,
     durationSec: audioBuffer.duration,
     analyzedStartSec: startSec,
     analyzedDurationSec: segSamples / sampleRate,

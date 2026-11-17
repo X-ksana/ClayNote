@@ -3,7 +3,11 @@ import {
   AudioLines,
   CheckCircle2,
   FileAudio,
+  Globe,
+  Link2,
+  Mic,
   Mic2,
+  MonitorSpeaker,
   Music,
   Play,
   SlidersHorizontal,
@@ -30,6 +34,7 @@ import {
   ExtractionMode,
   findBestTransposition,
   RawExtractedNote,
+  VocalRegister,
 } from '../utils/mp3Analyzer';
 import { OcarinaDiagram } from './OcarinaDiagram';
 
@@ -38,6 +43,8 @@ interface Mp3StudioTabProps {
   ocarinaKey: OcarinaKey;
   onSaveAndOpenSong: (song: Song) => void;
 }
+
+type AudioSourceTab = 'file' | 'tab-capture' | 'mic-url';
 
 function formatTime(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
@@ -69,6 +76,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
   ocarinaKey,
   onSaveAndOpenSong,
 }) => {
+  const [sourceTab, setSourceTab] = useState<AudioSourceTab>('file');
   const [fileName, setFileName] = useState<string>('');
   const [songTitle, setSongTitle] = useState<string>('');
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
@@ -79,11 +87,18 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
   });
   const [error, setError] = useState<string | null>(null);
 
+  // Extraction settings
   const [extractionMode, setExtractionMode] = useState<ExtractionMode>('vocal');
+  const [vocalRegister, setVocalRegister] = useState<VocalRegister>('female');
   const [startSec, setStartSec] = useState<number>(0);
   const [windowSec, setWindowSec] = useState<number>(60);
-  const [minNoteSec, setMinNoteSec] = useState<number>(0.13);
-  const [sensitivity, setSensitivity] = useState<number>(0.08);
+  const [minNoteSec, setMinNoteSec] = useState<number>(0.16);
+  const [sensitivity, setSensitivity] = useState<number>(0.07);
+
+  // Recording / Capture / URL states
+  const [captureKind, setCaptureKind] = useState<'none' | 'tab' | 'mic'>('none');
+  const [captureSeconds, setCaptureSeconds] = useState<number>(0);
+  const [audioUrlInput, setAudioUrlInput] = useState<string>('');
 
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [editableRawNotes, setEditableRawNotes] = useState<RawExtractedNote[]>([]);
@@ -95,6 +110,11 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
   const origSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const ocarinaTimersRef = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const captureStreamRef = useRef<MediaStream | null>(null);
+  const captureChunksRef = useRef<Blob[]>([]);
+  const captureTimerRef = useRef<number | null>(null);
 
   const stopPlayback = () => {
     if (origSourceRef.current) {
@@ -110,14 +130,31 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     setPlayingKind('none');
   };
 
+  const cleanupCapture = () => {
+    if (captureTimerRef.current !== null) {
+      window.clearInterval(captureTimerRef.current);
+      captureTimerRef.current = null;
+    }
+    if (captureStreamRef.current) {
+      captureStreamRef.current.getTracks().forEach((t) => t.stop());
+      captureStreamRef.current = null;
+    }
+    recorderRef.current = null;
+    setCaptureKind('none');
+  };
+
   useEffect(() => {
-    return () => stopPlayback();
+    return () => {
+      stopPlayback();
+      cleanupCapture();
+    };
   }, []);
 
   const runAnalysis = async (
     buf: AudioBuffer,
     opts?: {
       mode?: ExtractionMode;
+      register?: VocalRegister;
       start?: number;
       win?: number;
       minSec?: number;
@@ -125,6 +162,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     }
   ) => {
     const useMode = opts?.mode ?? extractionMode;
+    const useRegister = opts?.register ?? vocalRegister;
     const useStart = opts?.start ?? startSec;
     const useWin = opts?.win ?? windowSec;
     const useMinSec = opts?.minSec ?? minNoteSec;
@@ -135,6 +173,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     try {
       const res = await analyzeAudioBufferToMelody(buf, {
         mode: useMode,
+        vocalRegister: useRegister,
         startSec: useStart,
         maxDurationSec: useWin,
         minNoteSec: useMinSec,
@@ -150,35 +189,36 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
       setError(
         err instanceof Error
           ? err.message
-          : 'Could not analyze audio buffer. Try switching Extraction Mode or lowering Noise Gate.'
+          : 'Could not analyze audio buffer. Try adjusting Voice Gate or Vocal Register.'
       );
     } finally {
       setIsAnalyzing(false);
     }
   };
 
-  const handleFileChosen = async (file: File) => {
+  const processDecodedBlobOrBuffer = async (blob: Blob, labelName: string, titleGuess: string) => {
     stopPlayback();
     setError(null);
-    setFileName(file.name);
-    const cleanTitle = file.name.replace(/\.[^/.]+$/, '').replace(/[_-]+/g, ' ');
-    setSongTitle(cleanTitle);
+    setFileName(labelName);
+    setSongTitle(titleGuess);
     setStartSec(0);
-
     try {
       setIsAnalyzing(true);
-      setProgress({ pct: 2, stage: `Decoding ${file.name}...` });
-      const arrayBuf = await file.arrayBuffer();
+      setProgress({ pct: 2, stage: `Decoding ${labelName}...` });
+      const arrayBuf = await blob.arrayBuffer();
       const decoded = await decodeAudioSafely(arrayBuf);
       setAudioBuffer(decoded);
-      await runAnalysis(decoded, { mode: extractionMode, start: 0 });
+      await runAnalysis(decoded, { mode: extractionMode, register: vocalRegister, start: 0 });
     } catch (err) {
       setIsAnalyzing(false);
       const msg = err instanceof Error ? err.message : 'Unsupported audio codec';
-      setError(
-        `Could not decode "${file.name}" (${msg}). Please try a standard MP3, WAV, M4A, or OGG file.`
-      );
+      setError(`Could not decode "${labelName}" (${msg}). Try an MP3, WAV, M4A, or OGG file.`);
     }
+  };
+
+  const handleFileChosen = async (file: File) => {
+    const cleanTitle = file.name.replace(/\.[^/.]+$/, '').replace(/[_-]+/g, ' ');
+    await processDecodedBlobOrBuffer(file, file.name, cleanTitle);
   };
 
   const handleLoadSampleMelody = async () => {
@@ -193,6 +233,156 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
     const decoded = await decodeAudioSafely(arrayBuf);
     setAudioBuffer(decoded);
     await runAnalysis(decoded, { mode: 'solo', start: 0 });
+  };
+
+  // Start capturing YouTube / Bilibili browser tab audio (Desktop Chrome/Edge)
+  const startTabAudioCapture = async () => {
+    setError(null);
+    stopPlayback();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      setError(
+        'Tab audio capture is only supported in desktop browsers (Chrome/Edge). On a phone, use "Record Speaker / Mic" or upload an MP3 file.'
+      );
+      return;
+    }
+    try {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        } as MediaTrackConstraints,
+      });
+
+      const audioTracks = displayStream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        displayStream.getTracks().forEach((t) => t.stop());
+        setError(
+          'No audio track was shared! Please try again and check "Also share tab audio" in the browser popup.'
+        );
+        return;
+      }
+
+      const audioOnlyStream = new MediaStream(audioTracks);
+      captureStreamRef.current = displayStream;
+      captureChunksRef.current = [];
+
+      const recorder = new MediaRecorder(audioOnlyStream);
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) captureChunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        const mime = recorder.mimeType || 'audio/webm';
+        const recordedBlob = new Blob(captureChunksRef.current, { type: mime });
+        cleanupCapture();
+        await processDecodedBlobOrBuffer(
+          recordedBlob,
+          'captured-website-audio.webm',
+          'Captured YouTube / Bilibili Melody'
+        );
+      };
+
+      // Stop if user clicks browser's "Stop sharing" banner
+      audioTracks[0].onended = () => {
+        if (recorder.state === 'recording') recorder.stop();
+      };
+
+      recorderRef.current = recorder;
+      recorder.start(250);
+      setCaptureKind('tab');
+      setCaptureSeconds(0);
+      captureTimerRef.current = window.setInterval(() => {
+        setCaptureSeconds((s) => s + 1);
+      }, 1000);
+    } catch (err) {
+      cleanupCapture();
+      if (err instanceof Error && err.name !== 'NotAllowedError') {
+        setError(`Tab capture error: ${err.message}`);
+      }
+    }
+  };
+
+  // Record from phone/desktop microphone (speaker playback or singing/humming)
+  const startMicCapture = async () => {
+    setError(null);
+    stopPlayback();
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+      captureStreamRef.current = micStream;
+      captureChunksRef.current = [];
+      const recorder = new MediaRecorder(micStream);
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) captureChunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        const mime = recorder.mimeType || 'audio/webm';
+        const recordedBlob = new Blob(captureChunksRef.current, { type: mime });
+        cleanupCapture();
+        await processDecodedBlobOrBuffer(recordedBlob, 'mic-recording.webm', 'Recorded Melody');
+      };
+      recorderRef.current = recorder;
+      recorder.start(250);
+      setCaptureKind('mic');
+      setCaptureSeconds(0);
+      captureTimerRef.current = window.setInterval(() => {
+        setCaptureSeconds((s) => s + 1);
+      }, 1000);
+    } catch (err) {
+      cleanupCapture();
+      setError(
+        err instanceof Error
+          ? `Microphone error: ${err.message}`
+          : 'Could not access microphone.'
+      );
+    }
+  };
+
+  const stopActiveCapture = () => {
+    if (recorderRef.current && recorderRef.current.state === 'recording') {
+      recorderRef.current.stop();
+    } else {
+      cleanupCapture();
+    }
+  };
+
+  // Load direct audio URL (.mp3/.wav/.ogg)
+  const handleLoadAudioUrl = async () => {
+    const trimmed = audioUrlInput.trim();
+    if (!trimmed) return;
+    setError(null);
+
+    if (/youtube\.com|youtu\.be|bilibili\.com|b23\.tv/i.test(trimmed)) {
+      setError(
+        'YouTube & Bilibili webpage URLs block direct browser downloads (CORS) and require a paid server/yt-dlp to extract. On desktop, use the "Capture YouTube / Bilibili Tab" button right next to this tab — it records the playing song directly in your browser for free!'
+      );
+      return;
+    }
+
+    try {
+      setIsAnalyzing(true);
+      setProgress({ pct: 5, stage: 'Fetching audio URL...' });
+      const resp = await fetch(trimmed);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      const urlName = trimmed.split('/').pop()?.split('?')[0] || 'remote-audio.mp3';
+      await processDecodedBlobOrBuffer(
+        blob,
+        urlName,
+        urlName.replace(/\.[^/.]+$/, '').replace(/[_-]+/g, ' ')
+      );
+    } catch (err) {
+      setIsAnalyzing(false);
+      setError(
+        `Could not fetch URL directly (${err instanceof Error ? err.message : 'CORS blocked'}). Download the MP3 or use Tab Audio Capture instead.`
+      );
+    }
   };
 
   const bestFitInfo = useMemo(() => {
@@ -271,16 +461,16 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
 
   return (
     <div className="space-y-5">
-      {/* Header & Upload Dropzone */}
+      {/* Header & Source Selector */}
       <div className="bg-white rounded-2xl border border-[#E6DDD0] p-4 sm:p-6 shadow-xs space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-lg sm:text-xl font-bold text-[#2C221E] flex items-center gap-2">
               <AudioLines className="w-5 h-5 text-[#C2593F]" />
-              MP3-to-Ocarina Music Scroll Converter
+              Audio & Website-to-Ocarina Studio
             </h2>
             <p className="text-xs sm:text-sm text-[#6E5D55] mt-0.5">
-              Extracts singing vocals or solo instrument melodies in-browser and maps them onto playable ocarina fingerings.
+              Upload an MP3 or capture audio directly from a playing YouTube / Bilibili browser tab.
             </p>
           </div>
           <button
@@ -289,35 +479,224 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
             className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#FAF6F0] border border-[#E6DDD0] text-xs font-semibold text-[#C2593F] hover:border-[#C2593F] transition cursor-pointer shrink-0"
           >
             <Wand2 className="w-3.5 h-3.5" />
-            Try Sample Melody Audio
+            Try Sample Melody
           </button>
         </div>
 
-        {/* Extraction Mode Selector */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+        {/* 3 Audio Source Tabs */}
+        <div className="grid grid-cols-3 gap-1.5 bg-[#F3ECE1] p-1 rounded-xl">
+          <button
+            type="button"
+            onClick={() => setSourceTab('file')}
+            className={`py-2 px-2 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+              sourceTab === 'file' ? 'bg-white text-[#C2593F] shadow-xs' : 'text-[#6E5D55]'
+            }`}
+          >
+            <Upload className="w-3.5 h-3.5" />
+            <span>Upload MP3</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setSourceTab('tab-capture')}
+            className={`py-2 px-2 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+              sourceTab === 'tab-capture' ? 'bg-white text-[#C2593F] shadow-xs' : 'text-[#6E5D55]'
+            }`}
+          >
+            <Globe className="w-3.5 h-3.5" />
+            <span className="truncate">YouTube / Bilibili</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setSourceTab('mic-url')}
+            className={`py-2 px-2 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+              sourceTab === 'mic-url' ? 'bg-white text-[#C2593F] shadow-xs' : 'text-[#6E5D55]'
+            }`}
+          >
+            <Mic className="w-3.5 h-3.5" />
+            <span className="truncate">Mic / Audio URL</span>
+          </button>
+        </div>
+
+        {/* Source Panel */}
+        {sourceTab === 'file' && (
+          <>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="audio/*,.mp3,.wav,.m4a,.ogg,.aac"
+              className="hidden"
+              onClick={(e) => {
+                (e.target as HTMLInputElement).value = '';
+              }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleFileChosen(f);
+              }}
+            />
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                const f = e.dataTransfer.files?.[0];
+                if (f) handleFileChosen(f);
+              }}
+              className="border-2 border-dashed border-[#D4C5B3] hover:border-[#C2593F] bg-[#FAF6F0] rounded-2xl p-6 text-center cursor-pointer transition"
+            >
+              <div className="w-12 h-12 rounded-2xl bg-[#FCEEE9] text-[#C2593F] flex items-center justify-center mx-auto mb-3">
+                {fileName ? <FileAudio className="w-6 h-6" /> : <Upload className="w-6 h-6" />}
+              </div>
+              <div className="font-bold text-sm sm:text-base text-[#2C221E]">
+                {fileName
+                  ? `Loaded: ${fileName} (Tap to choose another)`
+                  : 'Tap or Drop an MP3 / WAV / M4A File Here'}
+              </div>
+              <p className="text-xs text-[#6E5D55] mt-1">
+                Tip: For full songs with vocals (like 牵丝戏.mp3), keep <strong>Song / Voice Focus</strong> ON and pick the verse/chorus section below.
+              </p>
+            </div>
+          </>
+        )}
+
+        {sourceTab === 'tab-capture' && (
+          <div className="bg-[#FAF6F0] rounded-2xl border border-[#E6DDD0] p-4 sm:p-5 space-y-3">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#FCEEE9] text-[#C2593F] flex items-center justify-center shrink-0">
+                <MonitorSpeaker className="w-5 h-5" />
+              </div>
+              <div className="text-xs sm:text-sm space-y-1">
+                <div className="font-bold text-[#2C221E]">
+                  Capture Playing YouTube / Bilibili / Spotify Tab (Free, Zero Server)
+                </div>
+                <ol className="list-decimal list-inside text-[#6E5D55] space-y-0.5 text-xs">
+                  <li>Open the song on YouTube or Bilibili in another browser tab.</li>
+                  <li>
+                    Click <strong>Capture Tab Audio</strong> below, choose that tab, and enable{' '}
+                    <strong>“Also share tab audio”</strong>.
+                  </li>
+                  <li>Play the chorus/verse (10–60s), then click <strong>Stop & Convert</strong>!</li>
+                </ol>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 pt-1">
+              {captureKind !== 'tab' ? (
+                <button
+                  type="button"
+                  onClick={startTabAudioCapture}
+                  disabled={captureKind === 'mic' || isAnalyzing}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#C2593F] text-white text-xs sm:text-sm font-bold hover:bg-[#9E412B] transition cursor-pointer"
+                >
+                  <MonitorSpeaker className="w-4 h-4" />
+                  Capture Tab Audio (Desktop)
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={stopActiveCapture}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#2C221E] text-white text-xs sm:text-sm font-bold animate-pulse cursor-pointer"
+                >
+                  <Square className="w-4 h-4" />
+                  Stop & Convert ({formatTime(captureSeconds)})
+                </button>
+              )}
+              <span className="text-[11px] text-[#6E5D55]">
+                Using a phone? Mobile browsers block cross-tab capture — switch to{' '}
+                <button
+                  type="button"
+                  onClick={() => setSourceTab('mic-url')}
+                  className="text-[#C2593F] font-semibold underline cursor-pointer"
+                >
+                  Mic / Audio URL
+                </button>{' '}
+                or upload an MP3.
+              </span>
+            </div>
+          </div>
+        )}
+
+        {sourceTab === 'mic-url' && (
+          <div className="bg-[#FAF6F0] rounded-2xl border border-[#E6DDD0] p-4 sm:p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="text-xs sm:text-sm font-bold text-[#2C221E]">
+                  Option A: Record Singing, Humming, or Nearby Speaker (Phone & Desktop)
+                </div>
+                <p className="text-xs text-[#6E5D55]">
+                  Play a YouTube/Bilibili song out loud (or hum the melody) into your phone mic.
+                </p>
+              </div>
+              {captureKind !== 'mic' ? (
+                <button
+                  type="button"
+                  onClick={startMicCapture}
+                  disabled={captureKind === 'tab' || isAnalyzing}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#C2593F] text-white text-xs font-bold hover:bg-[#9E412B] cursor-pointer shrink-0"
+                >
+                  <Mic className="w-4 h-4" />
+                  Record Audio
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={stopActiveCapture}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#2C221E] text-white text-xs font-bold animate-pulse cursor-pointer shrink-0"
+                >
+                  <Square className="w-4 h-4" />
+                  Stop & Convert ({formatTime(captureSeconds)})
+                </button>
+              )}
+            </div>
+
+            <div className="border-t border-[#E6DDD0] pt-3 space-y-2">
+              <div className="text-xs font-bold text-[#2C221E] flex items-center gap-1.5">
+                <Link2 className="w-3.5 h-3.5 text-[#C2593F]" />
+                Option B: Direct Audio File URL (.mp3 / .wav / .ogg)
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="url"
+                  value={audioUrlInput}
+                  onChange={(e) => setAudioUrlInput(e.target.value)}
+                  placeholder="https://example.com/melody.mp3"
+                  className="flex-1 bg-white border border-[#E6DDD0] rounded-xl px-3 py-2 text-xs text-[#2C221E]"
+                />
+                <button
+                  type="button"
+                  onClick={handleLoadAudioUrl}
+                  disabled={isAnalyzing || !audioUrlInput.trim()}
+                  className="px-3.5 py-2 rounded-xl bg-[#2C221E] text-white text-xs font-bold disabled:opacity-50 cursor-pointer"
+                >
+                  Load URL
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Vocal Isolation Mode + Register Settings */}
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-2.5">
           <button
             type="button"
             onClick={() => {
               setExtractionMode('vocal');
               if (audioBuffer) runAnalysis(audioBuffer, { mode: 'vocal' });
             }}
-            className={`p-3 rounded-xl border text-left transition cursor-pointer flex items-start gap-3 ${
+            className={`md:col-span-4 p-3 rounded-xl border text-left transition cursor-pointer flex items-start gap-2.5 ${
               extractionMode === 'vocal'
                 ? 'bg-[#FCEEE9] border-[#C2593F]'
                 : 'bg-[#FAF6F0] border-[#E6DDD0] hover:border-[#C2593F]/50'
             }`}
           >
             <Mic2
-              className={`w-5 h-5 shrink-0 mt-0.5 ${
+              className={`w-4 h-4 shrink-0 mt-0.5 ${
                 extractionMode === 'vocal' ? 'text-[#C2593F]' : 'text-[#6E5D55]'
               }`}
             />
             <div>
-              <div className="text-xs sm:text-sm font-bold text-[#2C221E]">
-                Song / Voice Focus (Recommended for MP3s)
-              </div>
-              <div className="text-[11px] text-[#6E5D55] mt-0.5">
-                Isolates center vocal range (155Hz–2.2kHz), reduces drums/bass, and tracks lead voice melody.
+              <div className="text-xs font-bold text-[#2C221E]">Song / Voice Focus</div>
+              <div className="text-[11px] text-[#6E5D55] leading-tight mt-0.5">
+                Mid-Side vocal isolation + key-aware contour tracking for MP3s with backing music.
               </div>
             </div>
           </button>
@@ -328,61 +707,43 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
               setExtractionMode('solo');
               if (audioBuffer) runAnalysis(audioBuffer, { mode: 'solo' });
             }}
-            className={`p-3 rounded-xl border text-left transition cursor-pointer flex items-start gap-3 ${
+            className={`md:col-span-4 p-3 rounded-xl border text-left transition cursor-pointer flex items-start gap-2.5 ${
               extractionMode === 'solo'
                 ? 'bg-[#FCEEE9] border-[#C2593F]'
                 : 'bg-[#FAF6F0] border-[#E6DDD0] hover:border-[#C2593F]/50'
             }`}
           >
             <Music
-              className={`w-5 h-5 shrink-0 mt-0.5 ${
+              className={`w-4 h-4 shrink-0 mt-0.5 ${
                 extractionMode === 'solo' ? 'text-[#C2593F]' : 'text-[#6E5D55]'
               }`}
             />
             <div>
-              <div className="text-xs sm:text-sm font-bold text-[#2C221E]">
-                Solo Instrument / Clean Voice
-              </div>
-              <div className="text-[11px] text-[#6E5D55] mt-0.5">
-                High-precision pitch tracking for solo flute, piano, ocarina, whistling, or acapella.
+              <div className="text-xs font-bold text-[#2C221E]">Solo Instrument / Clean</div>
+              <div className="text-[11px] text-[#6E5D55] leading-tight mt-0.5">
+                Precision YIN tracking for solo ocarina, flute, piano, or acapella singing.
               </div>
             </div>
           </button>
-        </div>
 
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="audio/*,.mp3,.wav,.m4a,.ogg,.aac"
-          className="hidden"
-          onClick={(e) => {
-            (e.target as HTMLInputElement).value = '';
-          }}
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) handleFileChosen(f);
-          }}
-        />
-
-        <div
-          onClick={() => fileInputRef.current?.click()}
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            const f = e.dataTransfer.files?.[0];
-            if (f) handleFileChosen(f);
-          }}
-          className="border-2 border-dashed border-[#D4C5B3] hover:border-[#C2593F] bg-[#FAF6F0] rounded-2xl p-6 text-center cursor-pointer transition"
-        >
-          <div className="w-12 h-12 rounded-2xl bg-[#FCEEE9] text-[#C2593F] flex items-center justify-center mx-auto mb-3">
-            {fileName ? <FileAudio className="w-6 h-6" /> : <Upload className="w-6 h-6" />}
+          <div className="md:col-span-4 p-3 rounded-xl border border-[#E6DDD0] bg-[#FAF6F0] flex flex-col justify-center">
+            <label className="text-[11px] font-bold text-[#6E5D55] uppercase tracking-wider mb-1">
+              Singer Vocal Range
+            </label>
+            <select
+              value={vocalRegister}
+              onChange={(e) => {
+                const nextReg = e.target.value as VocalRegister;
+                setVocalRegister(nextReg);
+                if (audioBuffer) runAnalysis(audioBuffer, { register: nextReg });
+              }}
+              className="bg-white border border-[#E6DDD0] rounded-lg px-2.5 py-1.5 text-xs font-bold text-[#2C221E]"
+            >
+              <option value="female">Female / High / Opera (G3–D6)</option>
+              <option value="auto">Auto / Mixed Range (F3–D6)</option>
+              <option value="male">Male / Low Vocal (C3–G5)</option>
+            </select>
           </div>
-          <div className="font-bold text-sm sm:text-base text-[#2C221E]">
-            {fileName ? `Loaded: ${fileName} (Tap to choose another)` : 'Tap or Drop an MP3 / WAV / M4A File Here'}
-          </div>
-          <p className="text-xs text-[#6E5D55] mt-1">
-            Runs 100% locally in your browser — works on phone and desktop with no file upload limits.
-          </p>
         </div>
 
         {isAnalyzing && (
@@ -414,9 +775,14 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
           <div className="bg-white rounded-2xl border border-[#E6DDD0] p-4 sm:p-5 shadow-xs space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex-1">
-                <label className="text-[11px] font-bold uppercase tracking-wider text-[#6E5D55]">
-                  Song Title for Scroll
-                </label>
+                <div className="flex items-center gap-2">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-[#6E5D55]">
+                    Song Title for Scroll
+                  </label>
+                  <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#FCEEE9] text-[#9E412B]">
+                    Detected Key: {analysis.detectedKeyName}
+                  </span>
+                </div>
                 <input
                   type="text"
                   value={songTitle}
@@ -483,7 +849,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
                 ))}
               </div>
 
-              {/* Section / Chorus Picker when track > 30s */}
+              {/* Section / Chorus Picker when track > 25s */}
               {totalDur > 25 && (
                 <div className="flex flex-wrap items-center justify-between gap-3 bg-[#FAF6F0] border border-[#E6DDD0] rounded-xl px-3 py-2 text-xs">
                   <div className="flex items-center gap-2 flex-1 min-w-[200px]">
@@ -604,15 +970,15 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <div className="flex justify-between text-[11px] text-[#6E5D55] mb-1">
-                      <span>Min Note</span>
+                      <span>Min Note (Phrasing)</span>
                       <span className="font-mono-tech font-bold">
                         {Math.round(minNoteSec * 1000)}ms
                       </span>
                     </div>
                     <input
                       type="range"
-                      min={0.08}
-                      max={0.28}
+                      min={0.1}
+                      max={0.3}
                       step={0.02}
                       value={minNoteSec}
                       onChange={(e) => setMinNoteSec(Number(e.target.value))}
@@ -643,7 +1009,7 @@ export const Mp3StudioTab: React.FC<Mp3StudioTabProps> = ({
                   <input
                     type="range"
                     min={0.01}
-                    max={0.22}
+                    max={0.2}
                     step={0.01}
                     value={sensitivity}
                     onChange={(e) => setSensitivity(Number(e.target.value))}
